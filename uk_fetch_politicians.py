@@ -1,19 +1,14 @@
 import requests
 import sqlite3
-import json
 import time
+import sys
 
 def create_database():
     """Create SQLite database with tables for members of both Houses"""
     conn = sqlite3.connect('uk_parliament_members.db')
     cursor = conn.cursor()
     
-    # Drop existing tables if they exist
-    cursor.execute("DROP TABLE IF EXISTS contact_details")
-    cursor.execute("DROP TABLE IF EXISTS constituencies")
-    cursor.execute("DROP TABLE IF EXISTS members")
-    
-    # Create table for members
+    # Create tables if they don't exist
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS members (
         id INTEGER PRIMARY KEY,
@@ -27,7 +22,6 @@ def create_database():
     )
     ''')
     
-    # Create table for contact details
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS contact_details (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,7 +32,6 @@ def create_database():
     )
     ''')
     
-    # Create table for constituencies/seats
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS constituencies (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,16 +46,15 @@ def create_database():
     conn.commit()
     return conn
 
-def fetch_members(house_type):
-    """Fetch members from the UK Parliament API"""
+def fetch_members_page(house_type, skip=0, take=50):
+    """Fetch a single page of members from the UK Parliament API"""
     base_url = "https://members-api.parliament.uk/api/Members/Search"
     
-    # Parameters for the API request
     params = {
         "House": house_type,  # 1 for Commons, 2 for Lords
         "IsCurrentMember": True,
-        "skip": 0,
-        "take": 1000  # Large enough to get all members
+        "skip": skip,
+        "take": take
     }
     
     try:
@@ -73,136 +65,115 @@ def fetch_members(house_type):
         print(f"Error fetching members: {e}")
         return None
 
-def fetch_member_details(member_id):
-    """Fetch detailed information about a specific member"""
-    url = f"https://members-api.parliament.uk/api/Members/{member_id}"
-    
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching member details for ID {member_id}: {e}")
-        return None
-
-def insert_member_data(conn, member_data, house_type):
-    """Insert member data into the database"""
+def process_house_members(conn, house_type, house_name, max_members=100):
+    """Process members for a specific house with pagination"""
     cursor = conn.cursor()
     
-    try:
-        # Extract basic member information
-        member_id = member_data["value"]["id"]
-        name = member_data["value"].get("nameDisplayAs", "Unknown")
-        gender = member_data["value"].get("gender", "Unknown")
+    # Check if we already have members for this house
+    cursor.execute("SELECT COUNT(*) FROM members WHERE house = ?", (house_name,))
+    existing_count = cursor.fetchone()[0]
+    
+    if existing_count > 0:
+        print(f"Already have {existing_count} {house_name} members in database.")
+        return existing_count
+    
+    print(f"Fetching {house_name} members (limited to {max_members})...")
+    
+    skip = 0
+    take = 50  # Fetch 50 at a time
+    total_fetched = 0
+    total_processed = 0
+    
+    while total_fetched < max_members:
+        print(f"Fetching page: skip={skip}, take={take}")
+        page_data = fetch_members_page(house_type, skip, take)
         
-        # Get party information
-        party = "Unknown"
-        if "latestParty" in member_data["value"] and member_data["value"]["latestParty"]:
-            party = member_data["value"]["latestParty"].get("name", "Unknown")
+        if not page_data or "items" not in page_data or not page_data["items"]:
+            print("No more members to fetch.")
+            break
         
-        # Determine current status based on membership status
-        current_status = "Current"  # Default to current since we're filtering for current members
+        members_page = page_data["items"]
+        total_results = page_data.get("totalResults", 0)
         
-        # Get house type (Commons or Lords)
-        house = "Commons" if house_type == 1 else "Lords"
+        print(f"Fetched {len(members_page)} members (total available: {total_results})")
+        total_fetched += len(members_page)
         
-        # Get membership dates if available
-        start_date = None
-        end_date = None
-        if "latestHouseMembership" in member_data["value"] and member_data["value"]["latestHouseMembership"]:
-            membership = member_data["value"]["latestHouseMembership"]
-            start_date = membership.get("membershipStartDate")
-            end_date = membership.get("membershipEndDate")
-        
-        # Insert into members table
-        cursor.execute('''
-        INSERT OR REPLACE INTO members (id, name, gender, party, house, current_status, start_date, end_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (member_id, name, gender, party, house, current_status, start_date, end_date))
-        
-        # Fetch detailed information for contact details and constituencies
-        details = fetch_member_details(member_id)
-        if details and "value" in details:
-            # Insert contact details if available
-            if "contactDetails" in details["value"] and details["value"]["contactDetails"]:
-                for contact_type, contacts in details["value"]["contactDetails"].items():
-                    for contact in contacts:
-                        contact_value = contact.get("line1", "")
-                        if contact_value:
-                            cursor.execute('''
-                            INSERT INTO contact_details (member_id, type, value)
-                            VALUES (?, ?, ?)
-                            ''', (member_id, contact_type, contact_value))
-            
-            # Insert constituency information for Commons members
-            if house_type == 1 and "latestHouseMembership" in details["value"] and details["value"]["latestHouseMembership"]:
-                if "membershipFrom" in details["value"]["latestHouseMembership"]:
-                    constituency = details["value"]["latestHouseMembership"]["membershipFrom"]
+        # Process each member in this page
+        for member in members_page:
+            try:
+                member_id = member["value"]["id"]
+                name = member["value"].get("nameDisplayAs", "Unknown")
+                gender = member["value"].get("gender", "Unknown")
+                
+                # Get party information
+                party = "Unknown"
+                if "latestParty" in member["value"] and member["value"]["latestParty"]:
+                    party = member["value"]["latestParty"].get("name", "Unknown")
+                
+                # Get membership dates if available
+                start_date = None
+                end_date = None
+                constituency = None
+                
+                if "latestHouseMembership" in member["value"] and member["value"]["latestHouseMembership"]:
+                    membership = member["value"]["latestHouseMembership"]
+                    start_date = membership.get("membershipStartDate")
+                    end_date = membership.get("membershipEndDate")
+                    
+                    # Get constituency for Commons members
+                    if house_type == 1 and "membershipFrom" in membership:
+                        constituency = membership["membershipFrom"]
+                
+                # Insert into members table
+                cursor.execute('''
+                INSERT OR REPLACE INTO members (id, name, gender, party, house, current_status, start_date, end_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (member_id, name, gender, party, house_name, "Current", start_date, end_date))
+                
+                # Insert constituency if available
+                if constituency:
                     cursor.execute('''
                     INSERT INTO constituencies (member_id, name, start_date, end_date)
                     VALUES (?, ?, ?, ?)
                     ''', (member_id, constituency, start_date, end_date))
+                
+                total_processed += 1
+                print(f"Processed {house_name} member: {name}")
+                
+            except Exception as e:
+                print(f"Error processing member: {e}")
         
         conn.commit()
-        return True
-    except Exception as e:
-        print(f"Error processing member {member_data['value'].get('nameDisplayAs', 'Unknown')}: {e}")
-        return False
+        
+        # Check if we've reached the end of available members
+        if len(members_page) < take or total_fetched >= total_results:
+            break
+        
+        skip += take
+        time.sleep(0.5)  # Small delay between pages
+    
+    print(f"Completed processing {total_processed} {house_name} members")
+    return total_processed
 
 def main():
-    # Create database
+    # Create or connect to database
     conn = create_database()
-    print("Database created successfully.")
+    print("Database ready.")
     
-    # Fetch and insert Commons members
-    print("Fetching House of Commons members...")
-    commons_members = fetch_members(1)
-    commons_success = 0
+    # Process Commons members (limited to 100 for this demo)
+    commons_count = process_house_members(conn, 1, "Commons", 100)
     
-    if commons_members and "items" in commons_members:
-        total_commons = len(commons_members["items"])
-        print(f"Found {total_commons} House of Commons members.")
-        
-        for i, member in enumerate(commons_members["items"]):
-            name = member["value"].get("nameDisplayAs", f"Member {i+1}")
-            print(f"Processing Commons member {i+1}/{total_commons}: {name}")
-            if insert_member_data(conn, member, 1):
-                commons_success += 1
-            # Add a small delay to avoid overwhelming the API
-            time.sleep(0.1)
-    
-    # Fetch and insert Lords members
-    print("Fetching House of Lords members...")
-    lords_members = fetch_members(2)
-    lords_success = 0
-    
-    if lords_members and "items" in lords_members:
-        total_lords = len(lords_members["items"])
-        print(f"Found {total_lords} House of Lords members.")
-        
-        for i, member in enumerate(lords_members["items"]):
-            name = member["value"].get("nameDisplayAs", f"Member {i+1}")
-            print(f"Processing Lords member {i+1}/{total_lords}: {name}")
-            if insert_member_data(conn, member, 2):
-                lords_success += 1
-            # Add a small delay to avoid overwhelming the API
-            time.sleep(0.1)
+    # Process Lords members (limited to 100 for this demo)
+    lords_count = process_house_members(conn, 2, "Lords", 100)
     
     # Print summary
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM members WHERE house='Commons'")
-    commons_count = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM members WHERE house='Lords'")
-    lords_count = cursor.fetchone()[0]
-    
     print(f"\nDatabase Summary:")
     print(f"- House of Commons members: {commons_count}")
     print(f"- House of Lords members: {lords_count}")
     print(f"- Total members: {commons_count + lords_count}")
-    print(f"- Successfully processed: {commons_success} Commons, {lords_success} Lords")
     
     # Print sample data
+    cursor = conn.cursor()
     print("\nSample data from members table:")
     cursor.execute("SELECT id, name, party, house FROM members LIMIT 5")
     for row in cursor.fetchall():
