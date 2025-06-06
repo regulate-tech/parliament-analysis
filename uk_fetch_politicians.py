@@ -1,3 +1,7 @@
+# Script to fetch all current UK members of both Houses of Parliament from the official Parliament API.
+# 06/06/2025 - returns 650 members of the Commons and 859 members of the Lords.
+# NB you can use a tool like sqlitebrowser to check the data after download.
+
 import requests
 import sqlite3
 import time
