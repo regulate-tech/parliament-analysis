@@ -25,7 +25,7 @@ You can set parameters within the scripts to analyse data for the timeframe that
 ## HOW
 
 1. you build a database of politicians for that area using scripts to pull data from public sources.
-2. you create a respository of speeches made by relevant politicians from public sources.
+2. you create a repository of speeches made by relevant politicians from public sources.
 3. you ask a Large Language Model (LLM) to analyse the repository of speeches drawing out individual politician interests.
 4. you can iterate with the LLM for different types of analysis and advice that would be useful to you.
 5. you present the output of the analysis in a format that makes it easy to understand and use.
